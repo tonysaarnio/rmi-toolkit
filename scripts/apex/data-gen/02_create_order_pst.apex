@@ -3,12 +3,13 @@
 // The generate.js CLI builds this dynamically for each order.
 //
 // ACCOUNT_ID       — Id of the Account to associate the order with
-// PRICEBOOK_ID     — Standard Price Book: 01sHu0000094NbPIAU
+// PRICEBOOK_ID     — Standard Price Book (org-specific; query it:
+//                    SELECT Id FROM Pricebook2 WHERE IsStandard = true)
 // EFFECTIVE_DATE   — YYYY-MM-DD (randomized Jan 2025–today by the toolkit)
 // Product/PBE IDs  — queried from the selected catalog pool
 
 final String ACCOUNT_ID     = '001Hu00000XXXXXXXXX';  // replace
-final String PRICEBOOK_ID   = '01sHu0000094NbPIAU';
+final String PRICEBOOK_ID   = '01sHu00000XXXXXXXXX';  // replace
 final String EFFECTIVE_DATE = '2025-06-15';
 
 // Line item data — add/remove as needed (3–10 lines in toolkit)
