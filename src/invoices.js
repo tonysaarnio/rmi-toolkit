@@ -1,4 +1,4 @@
-import { runApex, extractDebugLines, query } from './org.js';
+import { runApex, extractDebugLines, query, isTransientTransportError } from './org.js';
 
 // Invoicing resources were introduced at v62.0 (billingScheduleIds) — this is a
 // floor, not a preference. Pinned to the version the target orgs run.
@@ -187,8 +187,8 @@ function withErrorLogHint(message) {
   return `${message} [RTEL = RevenueTransactionErrorLog — see README → Invoicing for how to read it]`;
 }
 
-function runMarked(apex, successPrefix, failurePrefix) {
-  const lines = extractDebugLines(runApex(apex));
+function runMarked(apex, successPrefix, failurePrefix, apexOpts = {}) {
+  const lines = extractDebugLines(runApex(apex, apexOpts));
   let value = null;
   let error = '';
   for (const line of lines) {
@@ -294,12 +294,21 @@ export async function invoiceOrder(orderId, invoiceDate, onProgress = () => {}) 
   const invoiceId = await waitForInvoice(scheduleIds);
   onProgress(`    → Invoice ${invoiceId} drafted`);
 
-  const posted = runMarked(
-    buildPostInvoiceApex(invoiceId, marker),
-    'INVOICE_POST_SUCCESS',
-    'INVOICE_POST_FAILED'
-  );
-  if (posted.value === null) {
+  // The post targets an invoice that already exists, so a lost response is
+  // settled by reading its status below rather than by posting a second time.
+  let responseLost = false;
+  let posted = { value: null, error: '' };
+  try {
+    posted = runMarked(
+      buildPostInvoiceApex(invoiceId, marker),
+      'INVOICE_POST_SUCCESS',
+      'INVOICE_POST_FAILED'
+    );
+  } catch (err) {
+    if (!isTransientTransportError(err.message)) throw err;
+    responseLost = true;
+  }
+  if (!responseLost && posted.value === null) {
     throw new Error(posted.error || 'invoice post returned no result');
   }
 
@@ -310,7 +319,8 @@ export async function invoiceOrder(orderId, invoiceDate, onProgress = () => {}) 
   const tagged = runMarked(
     buildTagInvoiceApex(invoiceId, orderId, marker),
     'INVOICE_TAG_SUCCESS',
-    'INVOICE_TAG_FAILED'
+    'INVOICE_TAG_FAILED',
+    { retries: 2 }
   );
   if (tagged.value === null) {
     onProgress(`    ⚠ Invoice ${invoiceId} posted but could not be tagged: ${tagged.error}`);

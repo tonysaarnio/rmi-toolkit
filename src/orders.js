@@ -1,4 +1,4 @@
-import { runApex, extractDebugLines } from './org.js';
+import { runApex, extractDebugLines, query, isTransientTransportError } from './org.js';
 import { pickRandom, getStandardPricebookId, getCorporateCurrency, fetchProvenStandaloneProductIds } from './catalog.js';
 import { invoiceOrder } from './invoices.js';
 
@@ -60,7 +60,6 @@ function randInt(min, max) {
  * PST triggers async tax calculation; conversion fails if it hasn't finished.
  */
 async function waitForQuoteReady(quoteId, maxWaitMs = 30000) {
-  const { query } = await import('./org.js');
   const start = Date.now();
   while (Date.now() - start < maxWaitMs) {
     const records = query(`SELECT Id, CalculationStatus FROM Quote WHERE Id = '${quoteId}'`);
@@ -277,16 +276,23 @@ try {
     billToContact = contacts[0];
   }
 
-  Opportunity opp = new Opportunity(
-    Name = 'RMI-${quoteDate}-${randInt(1000, 9999)}',
-    AccountId = '${accountId}',
-    StageName = 'Prospecting',
-    CloseDate = Date.valueOf('${quoteDate}')
-  );
-  insert opp;
-  Quote q = new Quote(Id = '${quoteId}', OpportunityId = opp.Id);
-  update q;
-  System.debug('LINK_SUCCESS|${quoteId}|' + opp.Id + '|' + billToContact.Id);
+  // Adopt the stub Opportunity if this Quote is already linked. A retried run
+  // would otherwise insert a second one and orphan the first.
+  Quote linked = [SELECT Id, OpportunityId FROM Quote WHERE Id = '${quoteId}' LIMIT 1];
+  Id oppId = linked.OpportunityId;
+  if (oppId == null) {
+    Opportunity opp = new Opportunity(
+      Name = 'RMI-${quoteDate}-${randInt(1000, 9999)}',
+      AccountId = '${accountId}',
+      StageName = 'Prospecting',
+      CloseDate = Date.valueOf('${quoteDate}')
+    );
+    insert opp;
+    oppId = opp.Id;
+    Quote q = new Quote(Id = '${quoteId}', OpportunityId = oppId);
+    update q;
+  }
+  System.debug('LINK_SUCCESS|${quoteId}|' + oppId + '|' + billToContact.Id);
 } catch (Exception e) {
   System.debug('LINK_FAILED|${quoteId}|' + e.getMessage());
 }
@@ -326,6 +332,27 @@ try {
   System.debug('CONVERT_FAILED|${quoteId}|' + e.getMessage());
 }
 `;
+}
+
+function parseConvertOutput(output) {
+  let orderId = null;
+  let error = '';
+  for (const line of extractDebugLines(output)) {
+    if (line.startsWith('CONVERT_SUCCESS|')) orderId = line.split('|')[1];
+    else if (line.startsWith('CONVERT_FAILED|')) error = line.split('|').slice(2).join('|');
+  }
+  return { orderId, error };
+}
+
+/**
+ * Id of the Order already created from this Quote, or null. Distinguishes a
+ * conversion that committed but lost its response from one that never ran.
+ */
+function findOrderIdForQuote(quoteId) {
+  const rows = query(
+    `SELECT Id FROM Order WHERE QuoteId = '${quoteId}' ORDER BY CreatedDate DESC LIMIT 1`
+  );
+  return rows[0]?.Id ?? null;
 }
 
 /**
@@ -413,7 +440,7 @@ async function processOrder(account, quoteDate, pstApex, onProgress, created, fa
     }
 
     // Step 2 — Link Account via stub Opportunity, ensure Bill-To Contact exists
-    const linkOutput = runApex(buildLinkAccountApex(quoteId, account.id, quoteDate));
+    const linkOutput = runApex(buildLinkAccountApex(quoteId, account.id, quoteDate), { retries: 2 });
     const linkLines = extractDebugLines(linkOutput);
     let linkError = '';
     let contactId = null;
@@ -427,14 +454,21 @@ async function processOrder(account, quoteDate, pstApex, onProgress, created, fa
       return;
     }
 
-    // Step 3 — Convert Quote to Order
-    const convertOutput = runApex(buildConvertApex(quoteId));
-    const convertLines = extractDebugLines(convertOutput);
+    // Step 3 — Convert Quote to Order. Conversion creates a record, so a lost
+    // response is resolved by asking the org what happened rather than by
+    // repeating the call blind.
     let orderId = null;
     let convertError = '';
-    for (const line of convertLines) {
-      if (line.startsWith('CONVERT_SUCCESS|')) orderId = line.split('|')[1];
-      else if (line.startsWith('CONVERT_FAILED|')) convertError = line.split('|').slice(2).join('|');
+    try {
+      ({ orderId, error: convertError } = parseConvertOutput(runApex(buildConvertApex(quoteId))));
+    } catch (err) {
+      if (!isTransientTransportError(err.message)) throw err;
+      orderId = findOrderIdForQuote(quoteId);
+      if (orderId) {
+        onProgress(`  … conversion response lost; adopted committed Order ${orderId}`);
+      } else {
+        ({ orderId, error: convertError } = parseConvertOutput(runApex(buildConvertApex(quoteId))));
+      }
     }
     if (!orderId) {
       failed.push({ accountName: account.name, error: convertError || 'Conversion returned no Order ID' });
@@ -444,7 +478,8 @@ async function processOrder(account, quoteDate, pstApex, onProgress, created, fa
     onProgress(`  → Order ${orderId} created from Quote`);
 
     // Step 4 — Activate the Order
-    const activateOutput = runApex(buildActivationApex(orderId, contactId, quoteDate));
+    // Re-running this is a no-op: it re-sets fixed fields on a known Order.
+    const activateOutput = runApex(buildActivationApex(orderId, contactId, quoteDate), { retries: 2 });
     const activateLines = extractDebugLines(activateOutput);
     let activateFailed = false;
     for (const line of activateLines) {

@@ -33,6 +33,7 @@ Two things that will bite an automated caller:
 
 - **The interactive prompts can't be driven by piped stdin.** Piping answers into `node bin/generate.js` makes `readline` consume the buffer and hang. Use the [non-interactive drivers](#non-interactive-drivers), or `--org-type <key>` plus a pty.
 - **Failures are logged, not fatal.** A run reports `✓ created` and `✗ failures` and keeps going. Always read the summary — a "successful" run can still have failed orders. Common causes are an account with no billing/shipping address or no contact (activation is refused) and `TaxCalculationInProcess` (async pricing hadn't settled before conversion). Invoicing failures are tallied on a separate line and do **not** mean the order failed; see [Invoicing](#invoicing).
+- **Transport failures are retried; side effects are not repeated blindly.** A dropped connection to the org (`fetch failed`, `ECONNRESET`, a 502/503) surfaces as a failed order even though nothing was wrong with the request, and on a long run it will happen. Reads retry automatically. Writes are handled per step according to whether repeating them can duplicate a record — see [Transient transport failures](#transient-transport-failures).
 
 ---
 
@@ -187,6 +188,27 @@ RMI_TOTAL_ORDERS=120 node run_bundle_trend.js
 `run_bundle_trend.js` spreads orders across calendar months so that both order volume and revenue climb over time: monthly counts rise geometrically with noise, the larger bundle's share ramps up with recency, and the discount ceiling on flat orders ramps down. It targets only accounts that have a billing address, since those are the ones that can activate. Because the order's date is written to `Order.EffectiveDate`, charts built on this data must use `EffectiveDate` as the time axis, not `CreatedDate`.
 
 `run_bundle.js` reads its bundle list, default flat ratio and invoicing default from the same `src/orgTypes.js` entry the interactive CLI uses, so the two stay in sync. `RMI_INVOICING=0|1` overrides the invoicing default for one run.
+
+---
+
+## Transient transport failures
+
+The `sf` CLI occasionally fails to reach the org — `fetch failed`, `ECONNRESET`, a 502/503 — and the toolkit cannot tell that apart from a lost order without help. Over a 120-order run this is routine, so each step declares whether it may be repeated.
+
+The distinction that matters: **a lost response does not mean the work didn't happen.** PST takes 30–60s, so a client-side timeout has very likely already committed its Quote. Retrying blind would create a duplicate.
+
+| Step | On a transport failure | Why |
+|------|------------------------|-----|
+| Any SOQL read | Retried up to 3× | A read has no side effect |
+| PST (create Quote) | Not retried — order is failed and reported | No idempotency key exists to recognise a Quote it already created |
+| Link Account | Retried up to 3× | Made idempotent: adopts the Quote's existing stub Opportunity instead of inserting a second |
+| Convert to Order | Verified, then adopted or retried | `Order.QuoteId` identifies an Order the conversion already committed |
+| Activate Order | Retried up to 3× | Re-sets fixed fields on a known Order — a no-op the second time |
+| Invoice `generate` | Not retried — invoicing is failed and reported | No idempotency key; a second call means a second invoice |
+| Invoice `post` | Status is re-read to settle it | Targets an existing invoice, so `Invoice.Status` reveals whether the post landed |
+| Invoice tag | Retried up to 3× | An update to known ids, and its failure only warns |
+
+Two steps deliberately give up rather than risk a duplicate. If PST or `generate` reports a transport failure, the order or its invoice is genuinely lost and simply needs re-running.
 
 ---
 
