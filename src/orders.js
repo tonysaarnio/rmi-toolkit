@@ -1,5 +1,6 @@
 import { runApex, extractDebugLines } from './org.js';
 import { pickRandom, getStandardPricebookId, getCorporateCurrency, fetchProvenStandaloneProductIds } from './catalog.js';
+import { invoiceOrder } from './invoices.js';
 
 const WARN_THRESHOLD = 200;
 
@@ -104,7 +105,14 @@ function emitLineItem(n, item, quoteDate, opts = {}) {
   const parentLine = opts.parentRef
     ? `itemFields${n}.put('ParentQuoteLineItemId', '@{${opts.parentRef}.id}');\n`
     : '';
-  const subFields = emitSubscriptionFields(n, item, quoteDate, { omitBillingFrequency: opts.omitBillingFrequency });
+  // A bundle ROOT is a one-time container at the order level — its child
+  // components carry their own terms (set by the configurator). Stamping
+  // StartDate/EndDate/SubscriptionTerm on the root makes createOrderFromQuote
+  // reject it ("You can't specify EndDate for one-time order products"), so the
+  // caller passes omitSubscriptionFields for the bundle root.
+  const subFields = opts.omitSubscriptionFields
+    ? ''
+    : emitSubscriptionFields(n, item, quoteDate, { omitBillingFrequency: opts.omitBillingFrequency });
   return `
 RevSalesTrxn.RecordResource item${n} = new RevSalesTrxn.RecordResource(QuoteLineItem.getSobjectType(), 'POST');
 Map<String,Object> itemFields${n} = new Map<String,Object>();
@@ -239,6 +247,7 @@ function buildBundlePSTApex(quoteDate, bundle) {
     discountPct: 0,
     refName: 'refBundle',
     omitBillingFrequency: true,
+    omitSubscriptionFields: true,
   }));
   lines.push(pstFooter({ addDefaultConfiguration: true, executeConfigurationRules: true }));
   return lines.join('\n');
@@ -364,10 +373,15 @@ try {
 
 /**
  * Shared pipeline for one transaction: PST (Quote) → link Account →
- * createOrderFromQuote → Activate Order. Given the already-built PST apex,
- * runs the four steps, reporting progress and pushing to created/failed.
+ * createOrderFromQuote → Activate Order → (optionally) Invoice. Given the
+ * already-built PST apex, runs the steps, reporting progress and pushing to
+ * created/failed.
+ *
+ * `invoicing`, when supplied, is the shared invoice tally for the run:
+ * `{ enabled, invoiced, failed }`. See the Step 5 comment for why invoice
+ * outcomes are tracked apart from order outcomes.
  */
-async function processOrder(account, quoteDate, pstApex, onProgress, created, failed, postPstApexFn = null) {
+async function processOrder(account, quoteDate, pstApex, onProgress, created, failed, postPstApexFn = null, invoicing = null) {
   try {
     // Step 1 — Create priced Quote via PST
     const pstOutput = runApex(pstApex);
@@ -440,9 +454,27 @@ async function processOrder(account, quoteDate, pstApex, onProgress, created, fa
         failed.push({ accountName: account.name, error: `Activation: ${line.split('|').slice(2).join('|')}` });
       }
     }
-    if (!activateFailed) {
-      created.push(orderId);
-      onProgress(`  ✓ Order ${orderId} activated (from Quote ${quoteId})`);
+    if (activateFailed) return;
+
+    created.push(orderId);
+    onProgress(`  ✓ Order ${orderId} activated (from Quote ${quoteId})`);
+
+    // Step 5 — Invoice the activated order.
+    // Activation is the billing trigger, so this can only run here: it fires the
+    // Order-to-Billing-Schedule flow, and only the schedules that flow writes
+    // are invoiceable. A failure is nearly always a property of the org's
+    // billing configuration rather than a defect in the order, and the order is
+    // activated and correct either way — so the order stays in `created` and the
+    // invoice failure is tallied on its own.
+    if (invoicing?.enabled) {
+      try {
+        const { invoiceId, invoiceNumber } = await invoiceOrder(orderId, quoteDate, onProgress);
+        invoicing.invoiced.push(invoiceId);
+        onProgress(`  ✓ Invoice ${invoiceNumber || invoiceId} posted for Order ${orderId}`);
+      } catch (err) {
+        invoicing.failed.push({ accountName: account.name, orderId, error: err.message });
+        onProgress(`  ✗ Invoicing failed for Order ${orderId}: ${err.message}`);
+      }
     }
   } catch (err) {
     failed.push({ accountName: account.name, error: err.message });
@@ -452,10 +484,11 @@ async function processOrder(account, quoteDate, pstApex, onProgress, created, fa
 
 /**
  * Main order generation loop (flat, standalone line items).
- * Flow per transaction: PST (Quote) → link Account → createOrderFromQuote → Activate Order
+ * Flow per transaction: PST (Quote) → link Account → createOrderFromQuote →
+ * Activate Order → Invoice (when opts.invoicing).
  */
 export async function generateOrders(accounts, productPool, ordersPerAccount, onProgress, opts = {}) {
-  const { quantityRange = DEFAULT_QUANTITY_RANGE, maxOrderTotal = null } = opts;
+  const { quantityRange = DEFAULT_QUANTITY_RANGE, maxOrderTotal = null, invoicing = false } = opts;
   const totalOrders = accounts.length * ordersPerAccount;
 
   if (totalOrders > WARN_THRESHOLD) {
@@ -464,6 +497,10 @@ export async function generateOrders(accounts, productPool, ordersPerAccount, on
 
   const created = [];
   const failed = [];
+  const invoiceState = { enabled: !!invoicing, invoiced: [], failed: [] };
+  if (invoiceState.enabled) {
+    onProgress('Invoicing enabled: each activated order is invoiced and posted (adds ~30-60s per order).');
+  }
   let orderNum = 0;
 
   for (const account of accounts) {
@@ -475,11 +512,11 @@ export async function generateOrders(accounts, productPool, ordersPerAccount, on
 
       onProgress(`[${orderNum}/${totalOrders}] "${account.name}" — ${lineItems.length} line items, date ${quoteDate}`);
       const pstApex = buildPSTApex(quoteDate, lineItems, discounts, { quantityRange, maxOrderTotal });
-      await processOrder(account, quoteDate, pstApex, onProgress, created, failed);
+      await processOrder(account, quoteDate, pstApex, onProgress, created, failed, null, invoiceState);
     }
   }
 
-  return { created, failed };
+  return { created, failed, invoiced: invoiceState.invoiced, invoiceFailed: invoiceState.failed };
 }
 
 /**
@@ -491,12 +528,13 @@ export async function generateOrders(accounts, productPool, ordersPerAccount, on
  * @param bundles         [{ bundle, components }] from fetchBundlePool()
  * @param ordersPerAccount number
  * @param onProgress      msg => void
- * @param opts            { flatRatio = 0.35, quantityRange, maxOrderTotal }
+ * @param opts            { flatRatio = 0.35, quantityRange, maxOrderTotal, invoicing }
  */
 export async function generateMixedOrders(accounts, bundles, ordersPerAccount, onProgress, opts = {}) {
   const flatRatio = opts.flatRatio ?? 0.35;
   const quantityRange = opts.quantityRange ?? DEFAULT_QUANTITY_RANGE;
   const maxOrderTotal = opts.maxOrderTotal ?? null;
+  const invoiceState = { enabled: !!opts.invoicing, invoiced: [], failed: [] };
   const totalOrders = accounts.length * ordersPerAccount;
 
   if (totalOrders > WARN_THRESHOLD) {
@@ -528,6 +566,9 @@ export async function generateMixedOrders(accounts, bundles, ordersPerAccount, o
     flatPool = flatEligible.filter(c => c.sellingModelType === 'OneTime');
   }
   onProgress(`Flat pool: ${flatPool.length} proven standalone component product(s).`);
+  if (invoiceState.enabled) {
+    onProgress('Invoicing enabled: each activated order is invoiced and posted (adds ~30-60s per order).');
+  }
 
   const created = [];
   const failed = [];
@@ -554,9 +595,177 @@ export async function generateMixedOrders(accounts, bundles, ordersPerAccount, o
       }
 
       onProgress(`[${orderNum}/${totalOrders}] "${account.name}" — ${label}, date ${quoteDate}`);
-      await processOrder(account, quoteDate, pstApex, onProgress, created, failed, postPstApexFn);
+      await processOrder(account, quoteDate, pstApex, onProgress, created, failed, postPstApexFn, invoiceState);
     }
   }
 
-  return { created, failed };
+  return { created, failed, invoiced: invoiceState.invoiced, invoiceFailed: invoiceState.failed };
+}
+
+// ─── Trend helpers ─────────────────────────────────────────────────────────────
+
+// Enumerate calendar months from a 'YYYY-MM-DD' start through the current month
+// (inclusive). Returns [{ year, month }] with month 0-indexed (UTC).
+function enumerateMonths(startStr) {
+  const months = [];
+  const start = new Date(startStr + 'T00:00:00Z');
+  const now = new Date();
+  let y = start.getUTCFullYear();
+  let m = start.getUTCMonth();
+  const endY = now.getUTCFullYear();
+  const endM = now.getUTCMonth();
+  while (y < endY || (y === endY && m <= endM)) {
+    months.push({ year: y, month: m });
+    m++;
+    if (m > 11) { m = 0; y++; }
+  }
+  return months;
+}
+
+// Random 'YYYY-MM-DD' day inside a given (year, month). For the current month,
+// never returns a future day.
+function randomDayInMonth(year, month) {
+  const now = new Date();
+  const isCurrent = year === now.getUTCFullYear() && month === now.getUTCMonth();
+  const lastDay = isCurrent
+    ? now.getUTCDate()
+    : new Date(Date.UTC(year, month + 1, 0)).getUTCDate();
+  const day = randInt(1, Math.max(1, lastDay));
+  return new Date(Date.UTC(year, month, day)).toISOString().slice(0, 10);
+}
+
+// Linear interpolation between a and b by t∈[0,1].
+function lerp(a, b, t) {
+  return a + (b - a) * t;
+}
+
+/**
+ * Trend-aware generation, modeled on real quotes but arranged so BOTH order
+ * volume and revenue trend up over time ("up and to the right"):
+ *   - Orders are spread across calendar months from opts.trend.start → now.
+ *   - Monthly order counts rise geometrically ((1+growth)^monthIndex) with
+ *     multiplicative noise → steady growth that still looks organic.
+ *   - The share of the larger bundle (name contains trend.largeBundleMatch)
+ *     ramps from pLargeStart → pLargeEnd with recency, lifting average order
+ *     value so revenue climbs faster than volume alone.
+ *   - Flat orders (only if a proven-standalone pool exists) get a discount
+ *     ceiling that ramps DOWN with recency, raising recent net revenue.
+ * Each order reuses the exact per-order pipeline (processOrder → PST → link →
+ * convert → activate). The order's date is written to Order.EffectiveDate by the
+ * activation step, so charts must use EffectiveDate as the time axis.
+ *
+ * @param accounts   [{ id, name }]  (already filtered by the caller)
+ * @param bundles    [{ bundle, components }] from fetchBundlePool()
+ * @param onProgress msg => void
+ * @param opts       { quantityRange, maxOrderTotal, flatRatio = 0.15, invoicing, trend }
+ *   trend = { start = '2025-01-01', totalOrders = 120, growth = 0.10,
+ *             noise = 0.25, largeBundleMatch = 'Complete',
+ *             pLargeStart = 0.25, pLargeEnd = 0.80 }
+ */
+export async function generateTrendedOrders(accounts, bundles, onProgress, opts = {}) {
+  const quantityRange = opts.quantityRange ?? DEFAULT_QUANTITY_RANGE;
+  const maxOrderTotal = opts.maxOrderTotal ?? null;
+  const flatRatio = opts.flatRatio ?? 0.15;
+  const invoiceState = { enabled: !!opts.invoicing, invoiced: [], failed: [] };
+  const t = opts.trend ?? {};
+  const start = t.start ?? '2025-01-01';
+  const totalTarget = t.totalOrders ?? 120;
+  const growth = t.growth ?? 0.10;
+  const noise = t.noise ?? 0.25;
+  const largeBundleMatch = t.largeBundleMatch ?? 'Complete';
+  const pLargeStart = t.pLargeStart ?? 0.25;
+  const pLargeEnd = t.pLargeEnd ?? 0.80;
+
+  // Flat pool: bundle components proven to convert standalone (top-level items on
+  // activated orders), else OneTime components on a fresh org. Same rule as
+  // generateMixedOrders — keeps flat orders reliable.
+  const proven = fetchProvenStandaloneProductIds();
+  const flatSeen = new Set();
+  const allComponents = [];
+  for (const { components } of bundles) {
+    for (const c of components) {
+      if (!flatSeen.has(c.productId)) { flatSeen.add(c.productId); allComponents.push(c); }
+    }
+  }
+  const flatEligible = allComponents.filter(c => !c.isConfigurable);
+  let flatPool = flatEligible.filter(c => proven.has(c.productId));
+  if (!flatPool.length) flatPool = flatEligible.filter(c => c.sellingModelType === 'OneTime');
+
+  // Identify the "large" bundle (higher average order value) by name.
+  const largeIdx = bundles.findIndex(b =>
+    (b.bundle.productName || '').toLowerCase().includes(String(largeBundleMatch).toLowerCase()));
+
+  // Build a rising, noisy monthly schedule normalized to ~totalTarget orders.
+  const months = enumerateMonths(start);
+  const M = months.length;
+  const weights = months.map((_, i) =>
+    Math.pow(1 + growth, i) * lerp(1 - noise, 1 + noise, Math.random()));
+  const weightSum = weights.reduce((s, w) => s + w, 0) || 1;
+  // Assign EXACTLY totalTarget orders to months by weighted random draw. This
+  // preserves the rising+noisy shape while guaranteeing the requested count even
+  // when totalTarget is small relative to the number of months (a per-month
+  // rounding scheme would floor small totals to zero).
+  const counts = new Array(M).fill(0);
+  for (let n = 0; n < totalTarget; n++) {
+    let r = Math.random() * weightSum;
+    let idx = 0;
+    while (idx < M - 1 && (r -= weights[idx]) > 0) idx++;
+    counts[idx]++;
+  }
+  const schedule = [];
+  months.forEach((mo, i) => {
+    const frac = M > 1 ? i / (M - 1) : 1;
+    for (let k = 0; k < counts[i]; k++) {
+      schedule.push({ year: mo.year, month: mo.month, frac });
+    }
+  });
+
+  const totalOrders = schedule.length;
+  onProgress(`Trend schedule: ${totalOrders} order(s) across ${M} month(s) (${start} → now).`);
+  onProgress(`Flat pool: ${flatPool.length} proven standalone component product(s); flat share ~${Math.round(flatRatio * 100)}%.`);
+  if (invoiceState.enabled) {
+    onProgress('Invoicing enabled: each activated order is invoiced and posted (adds ~30-60s per order).');
+  }
+  if (totalOrders > WARN_THRESHOLD) {
+    onProgress(`⚠️  Warning: ${totalOrders} total orders. This will take a while. Proceeding...`);
+  }
+
+  const created = [];
+  const failed = [];
+  let orderNum = 0;
+
+  for (const slot of schedule) {
+    orderNum++;
+    const account = accounts[randInt(0, accounts.length - 1)];
+    const quoteDate = randomDayInMonth(slot.year, slot.month);
+    const goFlat = flatPool.length > 0 && Math.random() < flatRatio;
+
+    let pstApex;
+    let label;
+    if (goFlat) {
+      const lineItems = pickRandom(flatPool, randInt(3, Math.min(8, flatPool.length)));
+      // Discount ceiling ramps down with recency → higher recent net revenue.
+      const maxDisc = Math.round(lerp(40, 10, slot.frac));
+      const discounts = lineItems.map(() => randInt(0, maxDisc));
+      pstApex = buildPSTApex(quoteDate, lineItems, discounts, { quantityRange, maxOrderTotal });
+      label = `flat — ${lineItems.length} standalone line items (≤${maxDisc}% disc)`;
+    } else {
+      // Bundle mix by recency: prefer the large bundle more as time advances.
+      const pLarge = lerp(pLargeStart, pLargeEnd, slot.frac);
+      let idx;
+      if (largeIdx !== -1 && bundles.length > 1) {
+        idx = Math.random() < pLarge ? largeIdx : (largeIdx === 0 ? 1 : 0);
+      } else {
+        idx = randInt(0, bundles.length - 1);
+      }
+      const { bundle } = bundles[idx];
+      pstApex = buildBundlePSTApex(quoteDate, bundle);
+      label = `bundle "${bundle.productName}" (configurator default)`;
+    }
+
+    onProgress(`[${orderNum}/${totalOrders}] "${account.name}" — ${label}, date ${quoteDate}`);
+    await processOrder(account, quoteDate, pstApex, onProgress, created, failed, null, invoiceState);
+  }
+
+  return { created, failed, invoiced: invoiceState.invoiced, invoiceFailed: invoiceState.failed };
 }

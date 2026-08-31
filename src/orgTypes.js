@@ -29,6 +29,11 @@ export const ORG_TYPES = [
     // Hard ceiling on a generated quote/order total. Line quantities are scaled
     // down together if a quote would exceed it.
     maxOrderTotal: 10_000_000,
+    // Invoice each order after it activates (generate a Draft, then post it).
+    // Turn this off for an org whose billing engine isn't configured — the run
+    // still succeeds there, but every order pays the billing-schedule timeout
+    // before the invoice is given up on.
+    invoicing: true,
   },
   {
     key: 'manufacturing',
@@ -43,6 +48,7 @@ export const ORG_TYPES = [
     // Discrete manufactured parts ship in bulk.
     quantityRange: [100, 5000],
     maxOrderTotal: 10_000_000,
+    invoicing: true,
   },
 ];
 

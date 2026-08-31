@@ -10,6 +10,7 @@
 // Env knobs (for controlled/test runs):
 //   RMI_ACCOUNT_LIMIT=N   only target the first N accounts
 //   RMI_FLAT_RATIO=0..1   fraction of orders that are flat (default 0.35)
+//   RMI_INVOICING=0|1     invoice each activated order (default: the org type's)
 import 'dotenv/config';
 import { fetchBundlePool } from './src/catalog.js';
 import { fetchExistingAccounts } from './src/accounts.js';
@@ -22,6 +23,7 @@ const BUNDLE_NAMES = ORG_TYPE.bundleNames;
 const ORDERS_PER_ACCOUNT = parseInt(process.argv[2], 10) || 3;
 const ACCOUNT_LIMIT = process.env.RMI_ACCOUNT_LIMIT ? parseInt(process.env.RMI_ACCOUNT_LIMIT, 10) : null;
 const FLAT_RATIO = process.env.RMI_FLAT_RATIO != null ? parseFloat(process.env.RMI_FLAT_RATIO) : ORG_TYPE.flatRatio;
+const INVOICING = process.env.RMI_INVOICING != null ? process.env.RMI_INVOICING === '1' : ORG_TYPE.invoicing;
 // ─────────────────────────────────────────────────────────────────────────────
 
 function print(msg) { console.log(msg); }
@@ -55,9 +57,10 @@ if (!bundles.length) { print('No usable bundles. Exiting.'); process.exit(1); }
 // Phase 3 — Generation
 print('\n─── Phase 3: Order Generation ───────────────────────────────────────');
 print(`Accounts: ${accounts.length} | Orders each: ${ORDERS_PER_ACCOUNT} | Total: ${accounts.length * ORDERS_PER_ACCOUNT}`);
-print(`Mix: ~${Math.round((1 - FLAT_RATIO) * 100)}% bundle / ~${Math.round(FLAT_RATIO * 100)}% flat-from-components\n`);
+print(`Mix: ~${Math.round((1 - FLAT_RATIO) * 100)}% bundle / ~${Math.round(FLAT_RATIO * 100)}% flat-from-components`);
+print(`Invoicing: ${INVOICING ? 'on' : 'off'}\n`);
 
-const { created, failed } = await generateMixedOrders(
+const { created, failed, invoiced, invoiceFailed } = await generateMixedOrders(
   accounts,
   bundles,
   ORDERS_PER_ACCOUNT,
@@ -66,12 +69,20 @@ const { created, failed } = await generateMixedOrders(
     flatRatio: FLAT_RATIO,
     quantityRange: ORG_TYPE.quantityRange,
     maxOrderTotal: ORG_TYPE.maxOrderTotal,
+    invoicing: INVOICING,
   }
 );
 
 print('\n─── Summary ─────────────────────────────────────────────────────────');
 print(`✓ Orders created and activated: ${created.length}`);
 if (failed.length) {
-  print(`✗ Failures: ${failed.length}`);
+  print(`✗ Order failures: ${failed.length}`);
   for (const f of failed) print(`  ${f.accountName} — ${f.error}`);
+}
+if (invoiced.length || invoiceFailed.length) {
+  print(`✓ Invoices posted: ${invoiced.length}`);
+  if (invoiceFailed.length) {
+    print(`✗ Invoicing failures: ${invoiceFailed.length} (orders are still activated)`);
+    for (const f of invoiceFailed) print(`  ${f.accountName} — Order ${f.orderId} — ${f.error}`);
+  }
 }

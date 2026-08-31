@@ -32,6 +32,27 @@ function parseNumber(text) {
   return match ? parseInt(text.trim(), 10) : null;
 }
 
+/**
+ * Print the end-of-run tallies. Invoices are reported on their own line because
+ * an order can be activated and correct while its invoice fails — that failure
+ * points at the org's billing configuration, not at the order.
+ */
+function printRunSummary({ created, failed, invoiced = [], invoiceFailed = [] }) {
+  print('\n─── Summary ─────────────────────────────────────────────────────────');
+  print(`✓ Orders created and activated: ${created.length}`);
+  if (failed.length) {
+    print(`✗ Order failures: ${failed.length}`);
+    for (const f of failed) print(`  ${f.accountName} — ${f.error}`);
+  }
+  if (invoiced.length || invoiceFailed.length) {
+    print(`✓ Invoices posted: ${invoiced.length}`);
+    if (invoiceFailed.length) {
+      print(`✗ Invoicing failures: ${invoiceFailed.length} (orders are still activated)`);
+      for (const f of invoiceFailed) print(`  ${f.accountName} — Order ${f.orderId} — ${f.error}`);
+    }
+  }
+}
+
 // ─── Phase 0 — Org type ──────────────────────────────────────────────────────
 
 /**
@@ -174,6 +195,7 @@ async function phaseBundleOrders(accounts, bundles, orgType) {
   print('\n─── Phase 3: Order Generation ───────────────────────────────────────');
   print(`Accounts: ${accounts.length} | Bundles: ${bundles.map(b => b.bundle.productName).join(', ')}`);
   print(`Mix: ~${Math.round((1 - orgType.flatRatio) * 100)}% configured bundle orders / ~${Math.round(orgType.flatRatio * 100)}% flat standalone orders.`);
+  print(`Invoicing: ${orgType.invoicing ? 'on — each activated order is invoiced and posted' : 'off'}.`);
 
   let ordersPerAccount = null;
   while (!ordersPerAccount) {
@@ -190,7 +212,7 @@ async function phaseBundleOrders(accounts, bundles, orgType) {
   }
 
   print('\nGenerating orders...\n');
-  const { created, failed } = await generateMixedOrders(
+  const result = await generateMixedOrders(
     accounts,
     bundles,
     ordersPerAccount,
@@ -199,15 +221,11 @@ async function phaseBundleOrders(accounts, bundles, orgType) {
       flatRatio: orgType.flatRatio,
       quantityRange: orgType.quantityRange,
       maxOrderTotal: orgType.maxOrderTotal,
+      invoicing: orgType.invoicing,
     }
   );
 
-  print('\n─── Summary ─────────────────────────────────────────────────────────');
-  print(`✓ Orders created and activated: ${created.length}`);
-  if (failed.length) {
-    print(`✗ Failures: ${failed.length}`);
-    for (const f of failed) print(`  ${f.accountName} — ${f.error}`);
-  }
+  printRunSummary(result);
 }
 
 // ─── Phase 3 (catalog process) — Orders ──────────────────────────────────────
@@ -216,6 +234,7 @@ async function phaseOrders(accounts, productPool, orgType) {
   print('\n─── Phase 3: Order Generation ───────────────────────────────────────');
   print(`Accounts: ${accounts.length} | Products available: ${productPool.length}`);
   print('Each order: 3–10 random products, 0–40% discount per line, date spread Jan 2025–today.');
+  print(`Invoicing: ${orgType.invoicing ? 'on — each activated order is invoiced and posted' : 'off'}.`);
 
   let ordersPerAccount = null;
   while (!ordersPerAccount) {
@@ -232,20 +251,19 @@ async function phaseOrders(accounts, productPool, orgType) {
   }
 
   print('\nGenerating orders...\n');
-  const { created, failed } = await generateOrders(
+  const result = await generateOrders(
     accounts,
     productPool,
     ordersPerAccount,
     msg => print(msg),
-    { quantityRange: orgType.quantityRange, maxOrderTotal: orgType.maxOrderTotal }
+    {
+      quantityRange: orgType.quantityRange,
+      maxOrderTotal: orgType.maxOrderTotal,
+      invoicing: orgType.invoicing,
+    }
   );
 
-  print('\n─── Summary ─────────────────────────────────────────────────────────');
-  print(`✓ Orders created and activated: ${created.length}`);
-  if (failed.length) {
-    print(`✗ Failures: ${failed.length}`);
-    for (const f of failed) print(`  ${f.accountName} — ${f.error}`);
-  }
+  printRunSummary(result);
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────

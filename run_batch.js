@@ -55,17 +55,28 @@ print('\n─── Phase 3: Order Generation ───────────�
 print(`Accounts: ${accounts.length} | Orders each: ${ORDERS_PER_ACCOUNT} | Total: ${accounts.length * ORDERS_PER_ACCOUNT}`);
 print('Each order: 3–10 random products, 0–40% discount per line, date spread Jan 2025–today.\n');
 
-const { created, failed } = await generateOrders(
+const { created, failed, invoiced, invoiceFailed } = await generateOrders(
   accounts,
   productPool,
   ORDERS_PER_ACCOUNT,
   msg => print(msg),
-  { quantityRange: ORG_TYPE.quantityRange, maxOrderTotal: ORG_TYPE.maxOrderTotal }
+  {
+    quantityRange: ORG_TYPE.quantityRange,
+    maxOrderTotal: ORG_TYPE.maxOrderTotal,
+    invoicing: ORG_TYPE.invoicing,
+  }
 );
 
 print('\n─── Summary ─────────────────────────────────────────────────────────');
 print(`✓ Orders created and activated: ${created.length}`);
 if (failed.length) {
-  print(`✗ Failures: ${failed.length}`);
+  print(`✗ Order failures: ${failed.length}`);
   for (const f of failed) print(`  ${f.accountName} — ${f.error}`);
+}
+if (invoiced.length || invoiceFailed.length) {
+  print(`✓ Invoices posted: ${invoiced.length}`);
+  if (invoiceFailed.length) {
+    print(`✗ Invoicing failures: ${invoiceFailed.length} (orders are still activated)`);
+    for (const f of invoiceFailed) print(`  ${f.accountName} — Order ${f.orderId} — ${f.error}`);
+  }
 }
