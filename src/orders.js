@@ -104,11 +104,12 @@ function emitLineItem(n, item, quoteDate, opts = {}) {
   const parentLine = opts.parentRef
     ? `itemFields${n}.put('ParentQuoteLineItemId', '@{${opts.parentRef}.id}');\n`
     : '';
-  // A bundle ROOT is a one-time container at the order level — its child
-  // components carry their own terms (set by the configurator). Stamping
-  // StartDate/EndDate/SubscriptionTerm on the root makes createOrderFromQuote
-  // reject it ("You can't specify EndDate for one-time order products"), so the
-  // caller passes omitSubscriptionFields for the bundle root.
+  // Term fields on a bundle ROOT follow the root's own default selling model,
+  // and both directions are enforced: a OneTime root must not carry them
+  // (createOrderFromQuote rejects "You can't specify EndDate for one-time order
+  // products"), while a TermDefined/Evergreen root must (PST rejects with
+  // END_DATE_MISSING). emitSubscriptionFields already gates on sellingModelType,
+  // so omitSubscriptionFields is only for suppressing them regardless of model.
   const subFields = opts.omitSubscriptionFields
     ? ''
     : emitSubscriptionFields(n, item, quoteDate, { omitBillingFrequency: opts.omitBillingFrequency });
@@ -246,7 +247,6 @@ function buildBundlePSTApex(quoteDate, bundle) {
     discountPct: 0,
     refName: 'refBundle',
     omitBillingFrequency: true,
-    omitSubscriptionFields: true,
   }));
   lines.push(pstFooter({ addDefaultConfiguration: true, executeConfigurationRules: true }));
   return lines.join('\n');
