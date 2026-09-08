@@ -60,7 +60,19 @@ npm install
 # 2. Set your target org alias
 cp .env.example .env
 #    Edit .env and set SF_TARGET_ORG to your org alias
+
+# 3. On an org older than 264, pin the API version to the org's own maximum
+#    Edit .env and set RMI_API_VERSION (e.g. v67.0 for a Summer '26 org)
 ```
+
+`RMI_API_VERSION` defaults to `v68.0`, the version the 264 target orgs run. It is
+used only for the invoicing REST calls, so an org on an earlier version still
+generates and activates orders normally and then fails every invoice with
+`HTTP 404: NOT_FOUND` — the endpoint path simply doesn't exist at a version the
+org doesn't have. Check the org's ceiling with
+`sf api request rest '/services/data' --target-org <alias>` and set the value to
+the highest version listed. The floor is `v62.0`, where `billingScheduleIds` was
+introduced.
 
 ---
 
@@ -92,6 +104,8 @@ Invoices are dated with **the order's own date, not today** — `invoiceDate` is
 `targetDate`, which is a different thing, is **today**. It selects which billing periods are due, and the billing engine dates a subscription schedule from the subscription's own start rather than from the order's back-dated `EffectiveDate` — so an earlier target leaves those lines not-yet-due. The toolkit also drops schedules whose `NextBillingDate` is still in the future before calling `generate`, because `generate` rejects the *entire* call if any one submitted schedule falls outside the filter, and a single order legitimately mixes dates (a bundle's one-time lines bill on the order date while its subscription lines bill from their own start).
 
 **Invoicing failures never fail the order.** They are reported on their own summary line and the order stays counted as created. This is deliberate: an order that activated is correct and complete, and a failure at this stage almost always describes the *org*, not the order. The usual causes are a billing engine that isn't configured (no billing policies or treatments, or the Order-to-Billing-Schedule flow is inactive), a missing `AccountingPeriod` covering the order's back-dated invoice date, or missing General Ledger accounts for the account's region.
+
+One cause is neither of those and worth recognising on sight: if *every* invoice fails with `HTTP 404: NOT_FOUND` while the billing schedules are found normally, the org is on an API version older than `RMI_API_VERSION` and the endpoint path doesn't exist. See [Setup](#setup).
 
 If the target org has no billing configuration at all, set `invoicing: false` on its org type. Leaving it on still completes the run, but each order first burns the billing-schedule timeout (3 minutes) waiting for schedules that never arrive.
 
